@@ -1,122 +1,46 @@
-import { useState } from 'react'
-import reactLogo from './assets/react.svg'
-import viteLogo from './assets/vite.svg'
-import heroImg from './assets/hero.png'
-import './App.css'
+import React, { useState } from 'react';
+import LandingPage from './pages/LandingPage';
+import Step1 from './pages/Step1';
+import LoadingPhoto from './pages/LoadingPhoto';
+import Step2 from './pages/Step2';
+import Step3 from './pages/Step3';
+import Step4 from './pages/Step4';
+import GeneratingSticker from './pages/GeneratingSticker';
+import ResultPage from './pages/ResultPage';
+import './App.css';
 
 function App() {
-  const [count, setCount] = useState(0)
+  const [currentStep, setCurrentStep] = useState(0);
+
+  // Shared form data
+  const [formData, setFormData] = useState({
+    name: '',
+    photo: null,
+    day: '',
+    month: '',
+    year: '',
+    email: '',
+    club: '',
+    weight: '',
+    height: ''
+  });
+
+  const updateFormData = (data) => {
+    setFormData(prev => ({ ...prev, ...data }));
+  };
 
   return (
     <>
-      <section id="center">
-        <div className="hero">
-          <img src={heroImg} className="base" width="170" height="179" alt="" />
-          <img src={reactLogo} className="framework" alt="React logo" />
-          <img src={viteLogo} className="vite" alt="Vite logo" />
-        </div>
-        <div>
-          <h1>Get started</h1>
-          <p>
-            Edit <code>src/App.jsx</code> and save to test <code>HMR</code>
-          </p>
-        </div>
-        <button
-          type="button"
-          className="counter"
-          onClick={() => setCount((count) => count + 1)}
-        >
-          Count is {count}
-        </button>
-      </section>
-
-      <div className="ticks"></div>
-
-      <section id="next-steps">
-        <div id="docs">
-          <svg className="icon" role="presentation" aria-hidden="true">
-            <use href="/icons.svg#documentation-icon"></use>
-          </svg>
-          <h2>Documentation</h2>
-          <p>Your questions, answered</p>
-          <ul>
-            <li>
-              <a href="https://vite.dev/" target="_blank">
-                <img className="logo" src={viteLogo} alt="" />
-                Explore Vite
-              </a>
-            </li>
-            <li>
-              <a href="https://react.dev/" target="_blank">
-                <img className="button-icon" src={reactLogo} alt="" />
-                Learn more
-              </a>
-            </li>
-          </ul>
-        </div>
-        <div id="social">
-          <svg className="icon" role="presentation" aria-hidden="true">
-            <use href="/icons.svg#social-icon"></use>
-          </svg>
-          <h2>Connect with us</h2>
-          <p>Join the Vite community</p>
-          <ul>
-            <li>
-              <a href="https://github.com/vitejs/vite" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#github-icon"></use>
-                </svg>
-                GitHub
-              </a>
-            </li>
-            <li>
-              <a href="https://chat.vite.dev/" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#discord-icon"></use>
-                </svg>
-                Discord
-              </a>
-            </li>
-            <li>
-              <a href="https://x.com/vite_js" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#x-icon"></use>
-                </svg>
-                X.com
-              </a>
-            </li>
-            <li>
-              <a href="https://bsky.app/profile/vite.dev" target="_blank">
-                <svg
-                  className="button-icon"
-                  role="presentation"
-                  aria-hidden="true"
-                >
-                  <use href="/icons.svg#bluesky-icon"></use>
-                </svg>
-                Bluesky
-              </a>
-            </li>
-          </ul>
-        </div>
-      </section>
-
-      <div className="ticks"></div>
-      <section id="spacer"></section>
+      {currentStep === 0 && <LandingPage onStart={() => setCurrentStep(1)} />}
+      {currentStep === 1 && <Step1 onNext={() => setCurrentStep(2)} formData={formData} updateFormData={updateFormData} />}
+      {currentStep === 2 && <LoadingPhoto onFinish={() => setCurrentStep(3)} />}
+      {currentStep === 3 && <Step2 onNext={() => setCurrentStep(4)} onBack={() => setCurrentStep(1)} formData={formData} updateFormData={updateFormData} />}
+      {currentStep === 4 && <Step3 onNext={() => setCurrentStep(5)} onBack={() => setCurrentStep(3)} formData={formData} updateFormData={updateFormData} />}
+      {currentStep === 5 && <Step4 onNext={() => setCurrentStep(6)} onBack={() => setCurrentStep(4)} formData={formData} />}
+      {currentStep === 6 && <GeneratingSticker onFinish={() => setCurrentStep(7)} formData={formData} updateFormData={updateFormData} />}
+      {currentStep === 7 && <ResultPage formData={formData} />}
     </>
-  )
+  );
 }
 
-export default App
+export default App;

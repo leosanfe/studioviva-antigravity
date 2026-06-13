@@ -1,0 +1,108 @@
+/* Specific styles for Step 4 */
+
+.warning-highlight {
+  font-family: var(--font-body);
+  font-size: 0.85rem;
+  font-weight: 700;
+  color: var(--primary-blue);
+  margin-bottom: 1rem;
+}
+
+.review-photo-section {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 1rem;
+  margin-bottom: 1.2rem;
+}
+
+.review-photo-circle {
+  width: 80px;
+  height: 80px;
+  border-radius: 50%;
+  border: 3px solid var(--primary-blue);
+  overflow: hidden;
+  box-shadow: 0 4px 10px rgba(0,0,0,0.1);
+  flex-shrink: 0;
+}
+
+.review-photo-circle img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.review-photo-text {
+  font-family: var(--font-body);
+  font-size: 0.8rem;
+  font-weight: 500;
+  color: #333;
+  text-transform: uppercase;
+  max-width: 140px;
+  text-align: left;
+}
+
+.review-data-box {
+  background-color: #f8f9fa;
+  border-radius: 12px;
+  padding: 0.8rem 1rem;
+  margin-bottom: 1.5rem;
+  width: 100%;
+}
+
+.review-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 0.4rem;
+}
+
+.review-row:last-child {
+  margin-bottom: 0;
+}
+
+.review-label {
+  font-family: var(--font-heading);
+  color: var(--primary-blue);
+  font-size: 0.8rem;
+}
+
+.review-value {
+  font-family: var(--font-body);
+  color: #333;
+  font-weight: 600;
+  font-size: 0.8rem;
+}
+
+.step4-card {
+  max-width: 380px;
+  margin: 0 auto 2rem auto;
+}
+
+.step4-btn-primary {
+  width: 100%;
+  max-width: 100%; /* Override index.css */
+  border-radius: 12px;
+  font-size: 1.15rem; /* Slightly smaller to ensure fit */
+  padding: 12px;
+  margin-top: 1rem;
+  margin-bottom: 10px;
+}
+
+.step4-btn-secondary {
+  background-color: transparent;
+  color: #666;
+  border: 2px solid #ddd;
+  font-family: var(--font-heading);
+  letter-spacing: 1px;
+  border-radius: 12px;
+  cursor: pointer;
+  transition: all 0.2s;
+  width: 100%;
+  font-size: 1.1rem;
+  padding: 12px;
+}
+
+.step4-btn-secondary:hover {
+  background-color: #f0f0f0;
+}

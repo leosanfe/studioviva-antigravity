@@ -1,0 +1,27 @@
+/* Styles for GeneratingSticker */
+
+.gen-card {
+  max-width: 420px;
+  padding: 2rem 1.5rem;
+}
+
+.gen-subtitle {
+  font-size: 0.95rem;
+  margin-bottom: 1.5rem;
+}
+
+.video-container {
+  width: 100%;
+  border-radius: 16px;
+  overflow: hidden;
+  margin-bottom: 1.5rem;
+  box-shadow: 0 5px 15px rgba(0,0,0,0.15);
+}
+
+.promo-text {
+  background-color: #f8f9fa;
+  border-radius: 12px;
+  padding: 1.2rem;
+  width: 100%;
+  border: 1px dashed #ccc;
+}

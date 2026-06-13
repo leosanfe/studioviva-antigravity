@@ -1,0 +1,66 @@
+/* Specific styles for Step 2 */
+
+.date-dropdowns-container {
+  display: flex;
+  gap: 1rem;
+  width: 100%;
+}
+
+.dropdown-group {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+}
+
+.select-input {
+  width: 100%;
+  padding: 15px 10px;
+  border: 2px solid #e0e0e0;
+  border-radius: 12px;
+  font-family: var(--font-body);
+  font-size: 1.1rem;
+  color: #333;
+  outline: none;
+  background-color: #fff;
+  cursor: pointer;
+  appearance: none; /* remove default arrow to use custom if wanted, or leave it */
+  background-image: url("data:image/svg+xml;charset=UTF-8,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3e%3cpolyline points='6 9 12 15 18 9'%3e%3c/polyline%3e%3c/svg%3e");
+  background-repeat: no-repeat;
+  background-position: right 1rem center;
+  background-size: 1em;
+}
+
+.select-input:focus {
+  border-color: var(--primary-blue);
+}
+
+.buttons-row {
+  display: flex;
+  gap: 1rem;
+  width: 100%;
+  margin-top: 1rem;
+}
+
+.btn-outline {
+  background-color: transparent;
+  color: var(--primary-blue);
+  border: 2px solid var(--primary-blue);
+  font-family: var(--font-heading);
+  letter-spacing: 1px;
+  border-radius: 12px;
+  cursor: pointer;
+  transition: all 0.2s;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.btn-outline:hover {
+  background-color: rgba(29, 53, 114, 0.05);
+}
+
+.step-btn-half {
+  flex: 1;
+  font-size: 1.4rem;
+  padding: 12px;
+}
