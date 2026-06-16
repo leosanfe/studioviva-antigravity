@@ -19,7 +19,7 @@ const GeneratingSticker = ({ onFinish, formData, updateFormData }) => {
         });
         const data = await response.json();
         if (data.success && data.imageUrl) {
-          updateFormData({ generatedImage: data.imageUrl });
+          updateFormData({ generatedImage: data.imageUrl, orderId: data.orderId });
         } else {
           console.error("Erro da API:", data.error);
           updateFormData({ apiError: data.error, apiResponse: data.aiResponse });

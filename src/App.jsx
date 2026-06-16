@@ -7,10 +7,17 @@ import Step3 from './pages/Step3';
 import Step4 from './pages/Step4';
 import GeneratingSticker from './pages/GeneratingSticker';
 import ResultPage from './pages/ResultPage';
+import AdminPanel from './pages/AdminPanel';
 import './App.css';
 
 function App() {
   const [currentStep, setCurrentStep] = useState(0);
+  const [isAdmin, setIsAdmin] = useState(
+    window.location.pathname === '/admin' || 
+    window.location.pathname === '/admin/' ||
+    window.location.hash === '#/admin' ||
+    window.location.search.includes('admin=true')
+  );
 
   // Shared form data
   const [formData, setFormData] = useState({
@@ -28,6 +35,17 @@ function App() {
   const updateFormData = (data) => {
     setFormData(prev => ({ ...prev, ...data }));
   };
+
+  if (isAdmin) {
+    return (
+      <AdminPanel 
+        onClose={() => {
+          setIsAdmin(false);
+          window.history.pushState({}, '', '/');
+        }} 
+      />
+    );
+  }
 
   return (
     <>

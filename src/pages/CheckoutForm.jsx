@@ -278,7 +278,8 @@ function CheckoutContent({ formData, onSuccess, onClose }) {
             phone,
             amount: totalCents,
             selectedBumps,
-            generatedImage: formData.generatedImage
+            generatedImage: formData.generatedImage,
+            orderId: formData.orderId
           })
         });
 
@@ -314,7 +315,8 @@ function CheckoutContent({ formData, onSuccess, onClose }) {
             phone,
             amount: totalCents,
             selectedBumps,
-            generatedImage: formData.generatedImage
+            generatedImage: formData.generatedImage,
+            orderId: formData.orderId
           })
         });
 

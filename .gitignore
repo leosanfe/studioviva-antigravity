@@ -32,3 +32,4 @@ server/.env
 # Order logs and data
 server/orders/
 server/logs/
+server/weights/

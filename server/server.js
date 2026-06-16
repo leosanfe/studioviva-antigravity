@@ -20,228 +20,626 @@ app.use(express.json({
 }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
-// Initialize Gemini API
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || 'SUA_CHAVE_AQUI');
+// Initialize face-api, tfjs, and napi-rs canvas
+const sharp = require('sharp');
+const tf = require('@tensorflow/tfjs');
+require('@tensorflow/tfjs-backend-wasm');
+const faceapi = require('@vladmandic/face-api/dist/face-api.node-wasm.js');
+const { Canvas: NapiCanvas, Image, ImageData, loadImage } = require('@napi-rs/canvas');
 
-// Remove multer since we will accept JSON with base64
+// Subclass NapiCanvas to provide default width/height so native Rust bindings don't crash when instantiated without args
+class WrappedCanvas extends NapiCanvas {
+  constructor(width, height) {
+    const w = typeof width === 'number' ? width : 300;
+    const h = typeof height === 'number' ? height : 150;
+    super(w, h);
+  }
+}
+
+// Monkey patch face-api.js environment
+faceapi.env.monkeyPatch({ Canvas: WrappedCanvas, Image, ImageData });
+
+// Helper to download face-api weights if they don't exist
+const downloadWeights = async () => {
+  const weightsDir = path.join(__dirname, 'weights');
+  if (!fs.existsSync(weightsDir)) {
+    fs.mkdirSync(weightsDir);
+  }
+  const files = [
+    'ssd_mobilenetv1_model-weights_manifest.json',
+    'ssd_mobilenetv1_model.bin',
+    'face_landmark_68_model-weights_manifest.json',
+    'face_landmark_68_model.bin',
+    'face_recognition_model-weights_manifest.json',
+    'face_recognition_model.bin'
+  ];
+  const baseUrl = 'https://raw.githubusercontent.com/vladmandic/face-api/master/model/';
+  for (const file of files) {
+    const filePath = path.join(weightsDir, file);
+    if (!fs.existsSync(filePath)) {
+      console.log(`[FaceAPI] Baixando peso: ${file}...`);
+      const response = await fetch(baseUrl + file);
+      if (!response.ok) {
+        throw new Error(`Falha ao baixar peso ${file}: ${response.statusText}`);
+      }
+      const buffer = Buffer.from(await response.arrayBuffer());
+      fs.writeFileSync(filePath, buffer);
+      console.log(`[FaceAPI] Peso ${file} salvo com sucesso.`);
+    }
+  }
+};
+
+let isModelLoaded = false;
+const loadModel = async () => {
+  if (isModelLoaded) return;
+  
+  try {
+    console.log('[FaceAPI] Inicializando backend WASM do TensorFlow.js...');
+    await tf.setBackend('wasm');
+    await tf.ready();
+    console.log('[FaceAPI] Backend WASM pronto:', tf.getBackend());
+  } catch (error) {
+    console.error('[FaceAPI] Erro ao inicializar o backend WASM do TFJS:', error);
+    throw error;
+  }
+
+  await downloadWeights();
+  await faceapi.nets.ssdMobilenetv1.loadFromDisk(path.join(__dirname, 'weights'));
+  await faceapi.nets.faceLandmark68Net.loadFromDisk(path.join(__dirname, 'weights'));
+  await faceapi.nets.faceRecognitionNet.loadFromDisk(path.join(__dirname, 'weights'));
+  isModelLoaded = true;
+  console.log('[FaceAPI] Modelos de detecção, landmarks e reconhecimento facial carregados!');
+};
+
+// Get face landmarks and descriptors
+const getFaceDescriptor = async (imageBuffer) => {
+  const img = await loadImage(imageBuffer);
+  const detection = await faceapi.detectSingleFace(img)
+    .withFaceLandmarks()
+    .withFaceDescriptor();
+  return detection ? detection.descriptor : null;
+};
+
+// Check if original and generated faces are different
+const isFaceDifferent = (descriptor1, descriptor2) => {
+  if (!descriptor1 || !descriptor2) return true;
+  const distance = faceapi.euclideanDistance(descriptor1, descriptor2);
+  console.log(`[Validation] Distância Euclidiana entre faces: ${distance.toFixed(4)}`);
+  return distance > 0.6; // standard threshold
+};
+
+// Prepare photo by cropping the face with a 60% margin and resizing
+const preparePhoto = async (photoBuffer) => {
+  await loadModel();
+  
+  const img = await loadImage(photoBuffer);
+  const detection = await faceapi.detectSingleFace(img);
+  
+  if (!detection) {
+    throw new Error("Foto sem rosto visível");
+  }
+  
+  const { x, y, width, height } = detection.box;
+  const margin = 0.60;
+  const extraW = width * margin;
+  const extraH = height * margin;
+
+  let cropX = Math.round(x - extraW / 2);
+  let cropY = Math.round(y - extraH / 2);
+  let cropW = Math.round(width + extraW);
+  let cropH = Math.round(height + extraH);
+
+  // Clamp coordinates
+  if (cropX < 0) {
+    cropW += cropX;
+    cropX = 0;
+  }
+  if (cropY < 0) {
+    cropH += cropY;
+    cropY = 0;
+  }
+  if (cropX + cropW > img.width) {
+    cropW = img.width - cropX;
+  }
+  if (cropY + cropH > img.height) {
+    cropH = img.height - cropY;
+  }
+
+  if (cropW <= 0 || cropH <= 0) {
+    throw new Error("Recorte de face inválido.");
+  }
+
+  const croppedBuffer = await sharp(photoBuffer)
+    .extract({ left: cropX, top: cropY, width: cropW, height: cropH })
+    .resize({
+      width: 768,
+      height: 1024,
+      fit: 'cover',
+      position: 'center'
+    })
+    .jpeg({ quality: 92 })
+    .toBuffer();
+
+  return croppedBuffer.toString('base64');
+};
+
+const getCountryCode = (clubUpper) => {
+  if (clubUpper.includes('ARGENTINA')) return 'ARG';
+  if (clubUpper.includes('PORTUGAL')) return 'POR';
+  if (clubUpper.includes('FRANCA') || clubUpper.includes('FRANÇA')) return 'FRA';
+  if (clubUpper.includes('COREIA') || clubUpper.includes('KOREA')) return 'KOR';
+  if (clubUpper.includes('ESPANHA') || clubUpper.includes('SPAIN')) return 'ESP';
+  if (clubUpper.includes('NORUEGA') || clubUpper.includes('NORWAY')) return 'NOR';
+  return 'BRA';
+};
+
+const getCountryConfig = (countryCode) => {
+  const configs = {
+    ARG: {
+      bgDescription: "sky blue and white vertical stripes",
+      flag: "Argentina",
+      jerseyDescription: "sky blue and white striped Argentina national team shirt with black collar"
+    },
+    POR: {
+      bgDescription: "red and green background graphic",
+      flag: "Portugal",
+      jerseyDescription: "red Portugal national team shirt with green details"
+    },
+    FRA: {
+      bgDescription: "blue background with white and red shapes",
+      flag: "France",
+      jerseyDescription: "navy blue France national team shirt with white logo"
+    },
+    KOR: {
+      bgDescription: "red background with black and white shapes",
+      flag: "South Korea",
+      jerseyDescription: "red South Korea national team shirt"
+    },
+    ESP: {
+      bgDescription: "red background with yellow shapes",
+      flag: "Spain",
+      jerseyDescription: "red Spain national team shirt with yellow details"
+    },
+    NOR: {
+      bgDescription: "red background with blue and white cross shapes",
+      flag: "Norway",
+      jerseyDescription: "red Norway national team shirt with blue details"
+    },
+    BRA: {
+      bgDescription: "turquoise with green '26' graphic and yellow shape",
+      flag: "Brazil",
+      jerseyDescription: "yellow Brazil national team shirt with green collar (CBF Nike style)"
+    }
+  };
+  return configs[countryCode] || configs.BRA;
+};
+
+const formatStats = (height, weight) => {
+  let formattedHeight = '1,50 m';
+  if (height) {
+    const cleanHeight = height.toString().replace(/\D/g, '');
+    if (cleanHeight.length === 3) {
+      formattedHeight = `${cleanHeight[0]},${cleanHeight.slice(1)} m`;
+    } else if (cleanHeight.length === 2) {
+      formattedHeight = `0,${cleanHeight} m`;
+    } else {
+      formattedHeight = `${cleanHeight} m`;
+    }
+  }
+
+  let formattedWeight = '35 kg';
+  if (weight) {
+    const cleanWeight = weight.toString().replace(/\D/g, '');
+    formattedWeight = `${cleanWeight} kg`;
+  }
+  return `${formattedHeight} | ${formattedWeight}`;
+};
+
+const getReferenceTemplateBase64 = (countryCode) => {
+  const possiblePaths = [
+    `D:\\STUDIOVIVA\\imagens\\referencia_${countryCode}.png`,
+    path.join(__dirname, 'templates', `referencia_${countryCode}.png`),
+    `D:\\STUDIOVIVA\\imagens\\referencia.png`,
+    path.join(__dirname, 'template.png')
+  ];
+
+  for (const targetPath of possiblePaths) {
+    if (fs.existsSync(targetPath)) {
+      console.log(`[Config] Usando template de referência em: ${targetPath}`);
+      return fs.readFileSync(targetPath).toString('base64');
+    }
+  }
+  throw new Error("Nenhum template de referência encontrado.");
+};
+
+// SSE stream decoding
+const decodeStream = async (response) => {
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let imageBase64 = null;
+  let mimeType = "image/png";
+
+  const stream = response.body;
+  if (typeof stream[Symbol.asyncIterator] === 'function') {
+    for await (const chunk of stream) {
+      buffer += decoder.decode(chunk, { stream: true });
+      const result = parseBuffer(buffer);
+      buffer = result.buffer;
+      if (result.imageBase64) {
+        imageBase64 = result.imageBase64;
+        mimeType = result.mimeType;
+      }
+    }
+  } else {
+    const reader = stream.getReader();
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const result = parseBuffer(buffer);
+      buffer = result.buffer;
+      if (result.imageBase64) {
+        imageBase64 = result.imageBase64;
+        mimeType = result.mimeType;
+      }
+    }
+  }
+  return { imageBase64, mimeType };
+};
+
+const parseBuffer = (buffer) => {
+  const lines = buffer.split(/\r?\n/);
+  const remainingBuffer = lines.pop() ?? "";
+  let imageBase64 = null;
+  let mimeType = "image/png";
+  
+  for (const line of lines) {
+    if (!line.startsWith("data:")) continue;
+    const raw = line.slice(5).trim();
+    if (!raw || raw === "[DONE]") continue;
+    try {
+      const json = JSON.parse(raw);
+      const parts = json?.candidates?.[0]?.content?.parts ?? [];
+      for (const part of parts) {
+        if (part?.inlineData?.data) {
+          imageBase64 = part.inlineData.data;
+          mimeType = part.inlineData.mimeType ?? "image/png";
+        }
+      }
+    } catch (e) {}
+  }
+  return { buffer: remainingBuffer, imageBase64, mimeType };
+};
+
+// Call Gemini API streaming endpoint with auto model fallback and error retries
+const callGeminiWithRetry = async (payload, apiKey) => {
+  const models = ['gemini-3.1-flash-image', 'gemini-2.5-flash-image'];
+  let currentModelIndex = 0;
+  
+  while (currentModelIndex < models.length) {
+    const modelName = models[currentModelIndex];
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:streamGenerateContent?alt=sse&key=${apiKey}`;
+    
+    let attempts = 0;
+    const maxAttempts = 3;
+    
+    while (attempts < maxAttempts) {
+      attempts++;
+      console.log(`[Gemini] Tentativa ${attempts} de ${maxAttempts} com modelo ${modelName}...`);
+      
+      try {
+        const response = await fetch(url, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify(payload)
+        });
+        
+        const status = response.status;
+        
+        if (status === 200) {
+          const result = await decodeStream(response);
+          if (result.imageBase64) {
+            return result;
+          } else {
+            console.warn(`[Gemini] Status 200 mas sem dados de imagem para ${modelName}.`);
+            break; // trigger fallback to next model
+          }
+        }
+        
+        if (status === 400) {
+          const errText = await response.text();
+          console.error(`[Gemini] Erro 400:`, errText);
+          if (errText.includes("SAFETY") || errText.includes("PROHIBITED")) {
+            const safetyError = new Error("Foto bloqueada pelo sistema de segurança. Use foto frontal, rosto visível, sem outras pessoas.");
+            safetyError.isSafety = true;
+            throw safetyError;
+          }
+          throw new Error(`Erro 400: ${errText}`);
+        }
+        
+        if (status === 404 || status === 410) {
+          console.warn(`[Gemini] Modelo ${modelName} indisponível (HTTP ${status}). Fallback...`);
+          break; // break inner attempts to switch model
+        }
+        
+        if (status === 429) {
+          console.warn(`[Gemini] Limite de requisições excedido (429). Tentando novamente em 2s...`);
+          await new Promise(r => setTimeout(r, 2000));
+          continue;
+        }
+        
+        if (status >= 500) {
+          console.warn(`[Gemini] Erro de rede/servidor (HTTP ${status}). Re-tentando em 1s...`);
+          await new Promise(r => setTimeout(r, 1000));
+          continue;
+        }
+        
+        const errText = await response.text();
+        throw new Error(`Erro HTTP ${status}: ${errText}`);
+        
+      } catch (err) {
+        console.error(`[Gemini] Falha na tentativa ${attempts} com ${modelName}:`, err.message);
+        if (err.isSafety) throw err;
+        
+        if (attempts >= maxAttempts) {
+          console.error(`[Gemini] Esgotadas tentativas para o modelo ${modelName}.`);
+        } else {
+          await new Promise(r => setTimeout(r, 1000));
+        }
+      }
+    }
+    currentModelIndex++;
+  }
+  throw new Error("Todos os modelos e tentativas falharam na geração.");
+};
+
+// Check image visual similarity using a fast grayscale average absolute difference
+const isImageTooSimilar = async (imgBuffer1, imgBuffer2) => {
+  try {
+    const bytes1 = await sharp(imgBuffer1).resize(8, 8).grayscale().raw().toBuffer();
+    const bytes2 = await sharp(imgBuffer2).resize(8, 8).grayscale().raw().toBuffer();
+    
+    let diffSum = 0;
+    for (let i = 0; i < 64; i++) {
+      diffSum += Math.abs(bytes1[i] - bytes2[i]);
+    }
+    const avgDiff = diffSum / 64;
+    console.log(`[Validation] Diferença média visual com o template: ${avgDiff.toFixed(3)}`);
+    return avgDiff < 1.5; // less than ~0.5% diff
+  } catch (err) {
+    console.error("Erro na comparação de similaridade:", err);
+    return false;
+  }
+};
+
+// Verify if the generated image has a valid face
+const validateGeneratedFace = async (generatedBuffer) => {
+  try {
+    const img = await loadImage(generatedBuffer);
+    const detection = await faceapi.detectSingleFace(img);
+    return !!detection;
+  } catch (err) {
+    console.error("Erro ao validar face da figurinha gerada:", err);
+    return false;
+  }
+};
+
+// Main generator endpoint
 app.post('/api/generate-sticker', async (req, res) => {
   try {
-    const { name, weight, height, club, photo, day, month, year } = req.body;
+    const { name, weight, height, club, photo, day, month, year, email } = req.body;
 
     if (!photo) {
       return res.status(400).json({ error: 'Nenhuma foto enviada.' });
     }
 
-    const base64Data = photo.replace(/^data:image\/\w+;base64,/, "");
-    const photoBuffer = Buffer.from(base64Data, 'base64');
-
-    console.log(`Recebendo requisição para: ${name}, ${weight}kg, ${height}cm, ${club}, Nascimento: ${day}/${month}/${year}`);
+    console.log(`Recebendo requisição para: ${name}, ${weight}kg, ${height}cm, ${club}`);
 
     // ========================================================
-    // 1. CONSTRUINDO O PROMPT DA I.A. (Com seus parâmetros dinâmicos)
+    // 1. PRE-PROCESS PHOTO (FACE CROP)
+    // ========================================================
+    let croppedPhotoBase64;
+    let originalFaceDescriptor = null;
+    let originalPhotoBuffer = null;
+    
+    try {
+      const commaIndex = photo.indexOf(',');
+      const base64Data = commaIndex !== -1 ? photo.slice(commaIndex + 1) : photo;
+      const rawPhotoBuffer = Buffer.from(base64Data, 'base64');
+      
+      // Standardize the photo format to PNG via sharp for 100% compatibility with the canvas loader (handles WebP, JPEG, etc. robustly)
+      originalPhotoBuffer = await sharp(rawPhotoBuffer).png().toBuffer();
+      
+      await loadModel();
+      originalFaceDescriptor = await getFaceDescriptor(originalPhotoBuffer);
+      
+      croppedPhotoBase64 = await preparePhoto(originalPhotoBuffer);
+    } catch (err) {
+      console.error("[Pre-process] Falha no pré-processamento:", err.message);
+      if (err.message === "Foto sem rosto visível") {
+        return res.status(400).json({ error: "Foto sem rosto visível. Certifique-se de usar uma foto frontal, com boa iluminação." });
+      }
+      return res.status(400).json({ error: "Erro ao processar foto: " + err.message });
+    }
+
+    // ========================================================
+    // 2. CONSTRUCT PROMPT & CONSTANTS
     // ========================================================
     const birthDate = (day && month && year) ? `${day}-${month}-${year}` : '1-1-2010';
     const nameUpper = (name || '').toUpperCase().trim();
-    const nameSpelled = [...nameUpper].join('-');
     const clubUpper = (club || 'BRASIL').toUpperCase().trim();
-    const clubSpelled = [...clubUpper].join('-');
+    const statsLine = `${birthDate} | ${formatStats(height, weight)}`;
+    
+    const countryCode = getCountryCode(clubUpper);
+    const config = getCountryConfig(countryCode);
+    
+    const referenceTemplateBase64 = getReferenceTemplateBase64(countryCode);
+    const referenceTemplateBuffer = Buffer.from(referenceTemplateBase64, 'base64');
 
-    // Format height to standard meters (e.g. 175 -> 1,75 m)
-    let formattedHeight = '1,50 m';
-    if (height) {
-      const cleanHeight = height.toString().replace(/\D/g, '');
-      if (cleanHeight.length === 3) {
-        formattedHeight = `${cleanHeight[0]},${cleanHeight.slice(1)} m`;
-      } else if (cleanHeight.length === 2) {
-        formattedHeight = `0,${cleanHeight} m`;
-      } else {
-        formattedHeight = `${cleanHeight} m`;
-      }
-    }
-
-    // Format weight to kg (e.g. 75 -> 75 kg)
-    let formattedWeight = '35 kg';
-    if (weight) {
-      const cleanWeight = weight.toString().replace(/\D/g, '');
-      formattedWeight = `${cleanWeight} kg`;
-    }
-    const dynamicPrompt = `
-TASK: Produce a 2026 FIFA World Cup Panini collectible sticker that is VISUALLY INDISTINGUISHABLE from the supplied reference. You receive TWO images:
-
-1) FACELESS REFERENCE STICKER — the official Panini sticker template with the original player's face removed. This is the GROUND TRUTH for every visual element except the face and the name-plate text.
-
+    const mainPrompt = `TASK: Produce a 2026 FIFA World Cup Panini collectible sticker that is VISUALLY INDISTINGUISHABLE from the supplied reference. You receive TWO images:
+1) FACELESS REFERENCE STICKER — the official Panini sticker template with the original player's face removed. GROUND TRUTH for every visual element except the face and the name-plate text.
 2) PHOTO — the real person whose face replaces the reference player's face.
 
+TREAT THE REFERENCE AS A TEMPLATE. Copy it pixel-for-pixel. Do NOT redesign, restyle, simplify, "improve", re-illustrate, or paraphrase any visual element. The following must be reproduced IDENTICALLY:
+  • Turquoise background color (#2DBFC8 family).
+  • The huge "26" graphic in the upper-left → middle area, in country colors: ${config.bgDescription}.
+  • The white FIFA World Cup 2026 trophy + "FIFA" mark in the UPPER-RIGHT corner.
+  • The circular ${config.flag} flag badge on the RIGHT side at mid-height.
+  • The vertical 3-letter country code "${countryCode}" outlined (hollow letters) along the RIGHT edge.
+  • The Panini red-and-yellow logo badge at the bottom-right, overlapping the name plate.
 
+FACE & HEAD (CRITICAL): The reference template has a light blue / pale-turquoise "head silhouette" placeholder. This placeholder is a GUIDE ONLY — it MUST be completely removed. Replace the entire placeholder area with the real person's actual head, hair, ears and neck from PHOTO (2), seamlessly integrated against the turquoise (#2DBFC8) background. Do NOT keep, trace, outline, or partially preserve the lighter-blue head silhouette. Do NOT render a floating face inside a colored egg/oval/bubble. Do NOT leave any pale-blue halo or ring. The final head must look like a normal photographed head placed naturally on the turquoise background.
 
-TREAT THE REFERENCE AS A TEMPLATE. Copy it pixel-for-pixel. Do NOT redesign, restyle, simplify, "improve", re-illustrate, or paraphrase any visual element. The following must be reproduced IDENTICALLY in size, position, color, proportion and rendering style:
+PRESERVE THE REAL PERSON'S IDENTITY with maximum fidelity: exact skin tone, exact age, exact hairstyle and hair color, exact facial proportions, exact eye color and shape, exact nose shape, exact mouth, exact eyebrows, exact facial hair if any. Treat the face as a PHOTOGRAPHIC INSERT from PHOTO (2), not a stylized illustration. Do NOT stylize. Do NOT cartoonize. Do NOT 3D-render. Do NOT smooth skin. Do NOT change age. Do NOT change ethnicity. Never create Lionel Messi, Cristiano Ronaldo, Neymar, Mbappé, Haaland, Son or any other footballer likeness.
 
-• Turquoise background color (#2DBFC8 family).
+JERSEY & BODY: Torso wears a ${config.jerseyDescription} — visible shoulders, chest with team crest, collar. If photo (2) shows only head/face, generate shoulders/torso below the neck and dress them in the jersey. Match skin tone exactly to PHOTO (2). Match lighting and shadow direction.
 
-• The huge "26" graphic occupying the upper-left → middle area, in the EXACT country colors of the reference (turquoise with green '26' graphic and yellow shape). Same font weight, same outline, same overlap with the figure, same crop bleeding off the left edge.
+BODY MUST MATCH THE REAL AGE: use apparent age in PHOTO (2) AND stats (${statsLine}) to decide body type. Child = narrower shoulders, slim neck, child anatomy. Adult = athletic adult proportions. Never paste a child's head on adult body or vice versa.
 
-• The white FIFA World Cup 2026 trophy + "FIFA" mark in the UPPER-RIGHT corner — same size and position as the reference.
-
-• The circular Brazil flag badge on the RIGHT side at roughly mid-height — same diameter, same position, same flag rendering.
-
-• The vertical 3-letter country code "BRA" outlined (open / hollow letters) along the RIGHT edge — same height, same hollow stroke style as the reference. IMPORTANT: The letters must be ordered vertically from top to bottom starting with 'B' at the top, 'R' in the middle, and 'A' at the bottom (reading B-R-A from top to bottom, exactly like the reference). Do NOT reverse the letters to 'ARB' or 'A-R-B'.
-
-• The Panini red-and-yellow logo badge at the bottom-right, OVERLAPPING the name plate exactly like the reference.
-
-• The bottom name plate — see structure below.
-
-
-
-FACE & HEAD (CRITICAL - MAXIMUM likeness fidelity): 
-The face, head, hair, haircut, hair color, facial features, eyes, nose, mouth, skin tone, facial expression, and exact age of the person MUST be a 100% identical match to PHOTO (2). 
-Do NOT blend the face or hair of the person in PHOTO (2) with the reference template's placeholder face, head, or hair. 
-The template is ONLY a reference for background graphics and jersey style; the entire head (including hairstyle, hairline, ears, facial hair, facial shape) must be copied directly and identically from the person in PHOTO (2). 
-Ensure the hairstyle is exactly that of the person in PHOTO (2), without altering its shape, volume, length, or color.
-The final output must preserve the absolute likeness and identity of the person in PHOTO (2) without any modification to their face or head features.
-
-
-
-
-JERSEY & BODY PROPORTIONS (MANDATORY): Torso wears a yellow Brazil national team shirt with green collar (CBF Nike style) — visible shoulders, chest with team crest, and collar. If photo (2) shows only head/face, realistically generate shoulders/torso below the neck and dress them in the jersey, blending skin tone and lighting seamlessly. Never deliver a head-only sticker.
-
-BODY MUST MATCH THE REAL AGE OF THE PERSON IN THE PHOTO. Use the apparent age in PHOTO (2) AND the provided stats (Date of creation | height | weight) — especially birth date and height — to decide the correct body type. NEVER paste a child's head on an adult's body and NEVER paste an adult's head on a child's body. Concretely:
-
-• CHILD (under ~12 yrs / height under ~1.50m): narrower, rounder shoulders, slim neck, smaller torso, slightly larger head-to-body ratio (child anatomy ~1:5/1:6, not adult 1:7/1:8). The jersey is a kid-sized fit — looser, with no defined adult musculature, no broad athletic chest, no visible pecs/biceps, no adult jawline shadows on the neck.
-
-• TEEN (~13–17): in-between proportions, slimmer than an adult athlete, no exaggerated muscle.
-
-• ADULT (18+): normal adult athletic proportions appropriate to the height/weight.
-
-Match skin tone exactly to the face from PHOTO (2). Match lighting and shadow direction so head and body look photographed together — never composited. If the head in the output looks visibly out of scale with the body, the sticker is WRONG and must be redone.
-
-
-
-NAME PLATE — ABSOLUTE COLOR RULE (HIGHEST PRIORITY, overrides anything else): the name plate is NEVER white. NEVER cream. NEVER light gray. NEVER beige. NEVER any light or pale color. If you are about to render a white plate, STOP and recolor it to teal before outputting. Both bands are SOLID TEAL — slightly darker and more desaturated than the turquoise sticker background, identical to the plates on the Demian (BRA), Messi (ARG) and Cristiano Ronaldo reference stickers.
-
-Exact colors to use:
-
-• BAND 1 (upper, larger, full plate width): rounded rectangle filled with TEAL #3FA7B0 (a muted teal, clearly darker than the #2DBFC8 background, no white, no gradient, no glow).
-
-• BAND 2 (lower, narrower, flush under band 1): rounded rectangle filled with DARKER TEAL #2E8A93.
-
-Text in BOTH bands is pure WHITE (#FFFFFF), Panini condensed sans-serif, sharp and high-contrast against the teal fill. White text is the ONLY light element on the plate.
-
-BAND 1 contents (two stacked lines, both centered):
-
-• Line A — LARGE BOLD WHITE uppercase: "${nameUpper}" (IMPORTANT: Check spelling letter-by-letter to ensure it matches exactly. You MUST write exactly these letters in this order: ${nameSpelled}. Do not transpose characters).
-
-• Line B — smaller regular-weight WHITE: "${birthDate} | ${formattedHeight} | ${formattedWeight}" (Render this stats line exactly as written, double checking character by character).
-
-Render Line B EXACTLY as written: keep the " | " separators, the hyphens in the date and the comma in the height. Do NOT translate, reformat, abbreviate, or omit. If empty, leave Line B blank but keep the teal band the same height.
-
-BAND 2 contents:
-
-• Single centered line, WHITE bold uppercase: "${clubUpper}" (IMPORTANT: You MUST write the name exactly, checking letter-by-letter. You MUST render exactly these letters in this order: ${clubSpelled}. Do NOT transpose, swap, omit, or add any letters. For example, if it is "INTERNACIONAL", write it exactly as I-N-T-E-R-N-A-C-I-O-N-A-L, do NOT write "INTERNACAINAL". If it is "CORINTHIANS", write it exactly as C-O-R-I-N-T-H-I-A-N-S, do NOT write "CORINTHINAS" or swap any letters).
-
-The Panini red/yellow badge overlaps the right edge of both bands, just like the reference.
-
-FORBIDDEN on the name plate: white fills, cream fills, light gray fills, ivory fills, off-white fills, light gradients, glossy white highlights large enough to read as a white plate. If any band looks closer to white than to teal in the output, the sticker is WRONG and must be regenerated.
-
-
+NAME PLATE — ABSOLUTE COLOR RULE: The name plate is NEVER white, cream, light gray or beige. Both bands are SOLID TEAL.
+  • BAND 1 (upper, larger): rounded rectangle filled with TEAL #3FA7B0.
+  • BAND 2 (lower, narrower): rounded rectangle filled with DARKER TEAL #2E8A93.
+  Text in BOTH bands is pure WHITE (#FFFFFF), Panini condensed sans-serif.
+  BAND 1 Line A — LARGE BOLD WHITE uppercase: "${nameUpper}"
+  BAND 1 Line B — smaller regular WHITE: "${statsLine}" (check spelling letter-by-letter to ensure it matches exactly: ${[...nameUpper].join('-')} for name, and ${[...clubUpper].join('-')} for country. Do not transpose characters)
+  BAND 2 — single centered WHITE bold uppercase: "${clubUpper}"
 
 HARD CONSTRAINTS:
+  • Do NOT add, remove, resize, recolor, or reposition any decorative element from the reference.
+  • Do NOT invent extra text (no club, no jersey number, no position, no signature).
+  • Do NOT add borders, frames, watermarks, drop shadows.
+  • ABSOLUTELY NO text overlays beyond what is described. NEVER write "PREVIEW", "SAMPLE", "DEMO", "DRAFT", "WATERMARK", "MOCKUP".
+  • OUTPUT FORMAT IS MANDATORY 3:4 PORTRAIT (~900x1200 pixels). NEVER deliver square or landscape.
+  • The "26" appears EXACTLY ONCE on the background.
 
-• Do NOT add, remove, resize, recolor, or reposition any decorative element from the reference.
-
-• Do NOT invent extra text (no club, no age, no jersey number, no position, no signature, no slogan).
-
-• Do NOT add borders, frames, watermarks, drop shadows or "Panini-style" embellishments that aren't already in the reference.
-
-• ABSOLUTELY NO text overlays anywhere on the sticker other than what is explicitly described in this prompt. NEVER stamp, tile, repeat or write the words "PRÉVIA", "PREVIA", "PREVIEW", "SAMPLE", "DEMO", "DRAFT", "WATERMARK", "MOCKUP", "RASCUNHO", or any similar label. NEVER tile any word diagonally over the figure, jersey, face or background. The ONLY readable text allowed on the entire sticker is: "FIFA", the vertical country code "BRA", the player name "${nameUpper}", the stats line "${birthDate} | ${formattedHeight} | ${formattedWeight}", the country name "${clubUpper}", "Panini", "CBF/BRASIL" (or equivalent crest text on the jersey) and any text already baked into the reference template — nothing else.
-
-• FACE PLACEMENT: the real person's face from PHOTO (2) MUST fully fill the turquoise head silhouette of the reference. Do NOT leave the head silhouette empty, do NOT fill it with text, patterns or repeated words. If you cannot place the face, regenerate — never substitute it with text.
-
-• Do NOT change the aspect ratio or crop. The output image aspect ratio MUST match the exact aspect ratio of the template image in IMAGE (1) (which is approximately 0.67).
-
-• OUTPUT FORMAT MUST MATCH the template's aspect ratio of approximately 0.67 (taller and narrower than 3:4, roughly 900x1350 pixels). NEVER add any vertical or horizontal white bars, borders, margins, or padding on the left or right edges of the image. The sticker background must extend fully to the left and right edges.
-
-• The "26" appears EXACTLY ONCE on the background — never duplicated, never repeated in the upper-right corner, never as a smaller secondary "26" anywhere. The big numerals are background graphics, not stamps.
-
-
-
-OUTPUT: A single 2:3 portrait premium collectible sticker that looks like an authentic Panini 2026 sticker of this person — every design element matches the reference; only the face and the name-plate text are new.
-`;
-
-    console.log("Prompt Gerado para a IA:\n", dynamicPrompt);
+OUTPUT: A single 3:4 portrait premium collectible sticker. Every design element matches the reference; only the face and the name-plate text are new. The face must look photographically real and clearly identifiable as the person in PHOTO (2).`;
 
     // ========================================================
-    // 2. CHAMANDO A API REAL DO GEMINI
+    // 3. BUILD PAYLOAD
     // ========================================================
-    try {
-      // Tenta usar o modelo gemini-2.5-flash-image para ler as imagens e gerar a saída
-      const model = genAI.getGenerativeModel({ 
-        model: "gemini-2.5-flash-image",
-        generationConfig: {
-          imageConfig: {
-            aspectRatio: "2:3"
-          }
-        }
-      }); 
+    const payload = {
+      contents: [{
+        role: "user",
+        parts: [
+          { text: "IMAGE 1 BELOW = FACELESS REFERENCE STICKER TEMPLATE. Copy ONLY its layout, background, '26' graphic, flag, country code, jersey style, Panini badge and name plate. The turquoise head silhouette is only a placeholder and MUST be replaced." },
+          { inlineData: { mimeType: "image/png", data: referenceTemplateBase64 } },
+          { text: "IMAGE 2 BELOW = CUSTOMER FACE PHOTO. This is the ONLY source for the final person's face, skin tone, age, hairstyle and identity. Put this person into the empty turquoise placeholder from IMAGE 1." },
+          { inlineData: { mimeType: "image/jpeg", data: croppedPhotoBase64 } },
+          { text: mainPrompt },
+          { text: "FINAL REMINDER: IMAGE 1 has NO valid face. The output MUST show the customer from IMAGE 2 inside the sticker template. Never recreate Lionel Messi, Cristiano Ronaldo, or any reference-player likeness." }
+        ]
+      }],
+      generationConfig: {
+        responseModalities: ["IMAGE", "TEXT"]
+      }
+    };
+
+    // ========================================================
+    // 4. CALL API & VALIDATE
+    // ========================================================
+    let pipelineAttempts = 0;
+    const maxPipelineAttempts = 2;
+    let generatedImageBase64 = null;
+    let responseMimeType = 'image/png';
+    
+    while (pipelineAttempts < maxPipelineAttempts) {
+      pipelineAttempts++;
+      console.log(`[Pipeline] Geração - Tentativa ${pipelineAttempts} de ${maxPipelineAttempts}...`);
       
-      const imageParts = [];
-
-      // Se existir o template.png, a gente anexa junto no prompt como imagem 1 (FACELESS REFERENCE STICKER)
       try {
-        const templateBuffer = fs.readFileSync(path.join(__dirname, 'template.png'));
-        imageParts.push({
-          inlineData: {
-            data: templateBuffer.toString("base64"),
-            mimeType: "image/png"
+        const apiKey = process.env.GEMINI_API_KEY || 'SUA_CHAVE_AQUI';
+        const result = await callGeminiWithRetry(payload, apiKey);
+        
+        generatedImageBase64 = result.imageBase64;
+        responseMimeType = result.mimeType;
+        
+        const generatedBuffer = Buffer.from(generatedImageBase64, 'base64');
+        
+        // Validation 1: Aspect ratio (should be >= 1.15)
+        const metadata = await sharp(generatedBuffer).metadata();
+        const aspect = metadata.height / metadata.width;
+        console.log(`[Validation] Aspect ratio da figurinha gerada: ${aspect.toFixed(3)}`);
+        if (aspect < 1.15) {
+          console.warn("[Validation] Fail - Figurinha gerada não tem proporção vertical.");
+          continue;
+        }
+        
+        // Validation 2: Compare with template to verify it was modified
+        const tooSimilar = await isImageTooSimilar(generatedBuffer, referenceTemplateBuffer);
+        if (tooSimilar) {
+          console.warn("[Validation] Fail - Figurinha é idêntica ao template sem edições.");
+          continue;
+        }
+        
+        // Validation 3: Check if there's a face in the generated image
+        const hasFace = await validateGeneratedFace(generatedBuffer);
+        if (!hasFace) {
+          console.warn("[Validation] Fail - Nenhuma face detectada na figurinha gerada.");
+          continue;
+        }
+        
+        // Validation 4: Check facial embedding similarity
+        const generatedFaceDescriptor = await getFaceDescriptor(generatedBuffer);
+        if (originalFaceDescriptor && generatedFaceDescriptor) {
+          const faceDiff = isFaceDifferent(originalFaceDescriptor, generatedFaceDescriptor);
+          if (faceDiff) {
+            console.warn("[Validation] Fail - Face gerada é muito diferente do rosto original.");
+            continue;
           }
-        });
+        }
+        
+        console.log("[Pipeline] Sucesso! Validações concluídas com êxito.");
+        break;
+        
       } catch (err) {
-        console.log("Arquivo template.png não encontrado.");
-      }
-
-      // Adiciona a foto do cliente como imagem 2 (PHOTO)
-      imageParts.push({
-        inlineData: {
-          data: photoBuffer.toString("base64"),
-          mimeType: "image/jpeg"
+        if (err.isSafety) {
+          return res.status(400).json({ error: err.message });
         }
-      });
-
-      console.log("Enviando prompt para a API...");
-      const result = await model.generateContent([dynamicPrompt, ...imageParts]);
-      const response = await result.response;
-      
-      console.log("Resposta da IA recebida!");
-
-      let base64Image = null;
-      let mimeType = 'image/png';
-      let textResponse = '';
-
-      if (response.candidates && response.candidates[0].content && response.candidates[0].content.parts) {
-        for (const part of response.candidates[0].content.parts) {
-          if (part.inlineData) {
-            base64Image = part.inlineData.data;
-            mimeType = part.inlineData.mimeType || 'image/png';
-          } else if (part.text) {
-            textResponse += part.text;
-          }
+        console.error(`[Pipeline] Erro na tentativa ${pipelineAttempts}:`, err.message);
+        if (pipelineAttempts >= maxPipelineAttempts) {
+          return res.status(500).json({ error: 'Erro ao gerar figurinha na API do Gemini: ' + err.message });
         }
       }
-
-      if (base64Image) {
-        const finalImageBase64 = `data:${mimeType};base64,${base64Image}`;
-        console.log("Imagem gerada pela IA com sucesso!");
-        return res.json({ success: true, imageUrl: finalImageBase64, aiResponse: textResponse });
-      }
-
-      console.log("Nenhuma imagem gerada pela IA. Usando fallback da foto original.");
-      // Fallback: Retorna a própria foto enviada pelo usuário para ser estilizada como figurinha
-      const finalImageBase64 = `data:image/jpeg;base64,${photoBuffer.toString("base64")}`;
-      return res.json({ success: true, imageUrl: finalImageBase64, aiResponse: textResponse });
-
-    } catch (apiError) {
-      console.error('Erro na chamada da API do Gemini:', apiError);
-      return res.status(500).json({ error: 'Erro ao gerar na API da IA: ' + apiError.message });
     }
+
+    if (!generatedImageBase64) {
+      return res.status(500).json({ error: 'Falha ao validar e gerar figurinha após retentativas.' });
+    }
+
+    const finalImageBase64 = `data:${responseMimeType};base64,${generatedImageBase64}`;
+    
+    // ========================================================
+    // 5. SAVE ORDER LEAD
+    // ========================================================
+    const orderId = 'order_' + Date.now() + '_' + Math.random().toString(36).substr(2, 5);
+    const leadData = {
+      orderId,
+      name: name || '',
+      email: email || '',
+      birthday: `${day || ''}/${month || ''}/${year || ''}`,
+      club: club || '',
+      weight: weight || '',
+      height: height || '',
+      generatedImage: finalImageBase64,
+      status: "unpaid",
+      createdAt: new Date().toISOString()
+    };
+
+    try {
+      const ordersDir = getOrdersDir();
+      fs.writeFileSync(
+        path.join(ordersDir, `order_${orderId}.json`),
+        JSON.stringify(leadData, null, 2),
+        'utf8'
+      );
+      console.log(`Lead salvo com sucesso: order_${orderId}.json`);
+    } catch (err) {
+      console.error("Erro ao salvar lead de figurinha gerada:", err);
+    }
+
+    return res.json({ success: true, imageUrl: finalImageBase64, orderId, aiResponse: "Sticker gerado e validado." });
 
   } catch (error) {
     console.error('Erro na geração:', error);
@@ -274,6 +672,37 @@ const sendConfirmationEmail = async (orderId) => {
     }
 
     const orderData = JSON.parse(fs.readFileSync(orderPath, 'utf8'));
+
+    let statusUpdated = false;
+    if (orderData.status !== 'paid') {
+      orderData.status = 'paid';
+      orderData.paidAt = new Date().toISOString();
+      statusUpdated = true;
+    }
+
+    // Sync to original order_xxx.json lead file
+    if (orderData.orderId) {
+      const leadPath = path.join(ordersDir, `order_${orderData.orderId}.json`);
+      if (fs.existsSync(leadPath)) {
+        try {
+          const leadData = JSON.parse(fs.readFileSync(leadPath, 'utf8'));
+          const updatedLead = {
+            ...leadData,
+            ...orderData,
+            status: 'paid',
+            paidAt: orderData.paidAt || new Date().toISOString()
+          };
+          fs.writeFileSync(leadPath, JSON.stringify(updatedLead, null, 2), 'utf8');
+          console.log(`[Sync] Lead order_${orderData.orderId}.json atualizado para PAID.`);
+        } catch (syncErr) {
+          console.error(`[Sync] Erro ao sincronizar lead:`, syncErr);
+        }
+      }
+    }
+
+    if (statusUpdated) {
+      fs.writeFileSync(orderPath, JSON.stringify(orderData, null, 2), 'utf8');
+    }
 
     if (orderData.emailSent) {
       console.log(`[Email] E-mail já enviado anteriormente para o pedido ${orderId}.`);
@@ -542,19 +971,57 @@ const sendFacebookPurchaseEvent = async (orderId) => {
 // 1. ABACATE PAY - CREATE PIX BILLING
 app.post('/api/payment/pix/create', async (req, res) => {
   try {
-    const { name, email, cpf, phone, amount, selectedBumps, generatedImage } = req.body;
+    const { name, email, cpf, phone, amount, selectedBumps, generatedImage, orderId } = req.body;
     
+    const ordersDir = getOrdersDir();
+    let leadData = {};
+    if (orderId) {
+      const leadPath = path.join(ordersDir, `order_${orderId}.json`);
+      if (fs.existsSync(leadPath)) {
+        try {
+          leadData = JSON.parse(fs.readFileSync(leadPath, 'utf8'));
+        } catch (err) {
+          console.error(`Erro ao carregar lead order_${orderId}.json:`, err);
+        }
+      }
+    }
+
     // Check if API key is set
     const apiKey = process.env.ABACATEPAY_API_KEY;
     if (!apiKey || apiKey.includes('placeholder')) {
       console.warn("Abacate Pay API key is missing or placeholder. Using simulated payment response.");
       
       const mockId = 'mock_pix_' + Date.now();
-      const ordersDir = getOrdersDir();
+      const updatedOrder = {
+        ...leadData,
+        orderId: orderId || leadData.orderId || '',
+        paymentId: mockId,
+        name: name || leadData.name || '',
+        email: email || leadData.email || '',
+        cpf: cpf || leadData.cpf || '',
+        phone: phone || leadData.phone || '',
+        selectedBumps: selectedBumps || leadData.selectedBumps || [false, false, false, false, false],
+        generatedImage: leadData.generatedImage || generatedImage || '',
+        amount: amount || 1290,
+        isMock: true,
+        emailSent: false,
+        paymentMethod: 'pix',
+        status: 'pending',
+        createdAt: leadData.createdAt || new Date().toISOString(),
+        paymentCreatedAt: new Date().toISOString()
+      };
+
       fs.writeFileSync(
         path.join(ordersDir, `${mockId}.json`),
-        JSON.stringify({ name, email, cpf, phone, selectedBumps, generatedImage, amount: amount || 1290, isMock: true, emailSent: false }, null, 2)
+        JSON.stringify(updatedOrder, null, 2)
       );
+
+      if (orderId) {
+        fs.writeFileSync(
+          path.join(ordersDir, `order_${orderId}.json`),
+          JSON.stringify({ ...updatedOrder, status: 'pending' }, null, 2)
+        );
+      }
 
       // Return a simulated/mock PIX payment for testing
       return res.json({
@@ -602,11 +1069,36 @@ app.post('/api/payment/pix/create', async (req, res) => {
     if (result.success && result.data) {
       // Save order details to local orders directory
       const billingId = result.data.id;
-      const ordersDir = getOrdersDir();
+      const updatedOrder = {
+        ...leadData,
+        orderId: orderId || leadData.orderId || '',
+        paymentId: billingId,
+        name: name || leadData.name || '',
+        email: email || leadData.email || '',
+        cpf: cpf || leadData.cpf || '',
+        phone: phone || leadData.phone || '',
+        selectedBumps: selectedBumps || leadData.selectedBumps || [false, false, false, false, false],
+        generatedImage: leadData.generatedImage || generatedImage || '',
+        amount: finalAmount,
+        isMock: false,
+        emailSent: false,
+        paymentMethod: 'pix',
+        status: 'pending',
+        createdAt: leadData.createdAt || new Date().toISOString(),
+        paymentCreatedAt: new Date().toISOString()
+      };
+
       fs.writeFileSync(
         path.join(ordersDir, `${billingId}.json`),
-        JSON.stringify({ name, email, cpf, phone, selectedBumps, generatedImage, amount: finalAmount, isMock: false, emailSent: false }, null, 2)
+        JSON.stringify(updatedOrder, null, 2)
       );
+
+      if (orderId) {
+        fs.writeFileSync(
+          path.join(ordersDir, `order_${orderId}.json`),
+          JSON.stringify({ ...updatedOrder, status: 'pending' }, null, 2)
+        );
+      }
 
       return res.json({
         success: true,
@@ -680,7 +1172,20 @@ app.get('/api/payment/pix/status/:id', async (req, res) => {
 // 3. STRIPE - CREATE PAYMENT INTENT
 app.post('/api/payment/stripe/create-intent', async (req, res) => {
   try {
-    const { email, name, phone, amount, selectedBumps, generatedImage } = req.body;
+    const { email, name, phone, amount, selectedBumps, generatedImage, orderId } = req.body;
+
+    const ordersDir = getOrdersDir();
+    let leadData = {};
+    if (orderId) {
+      const leadPath = path.join(ordersDir, `order_${orderId}.json`);
+      if (fs.existsSync(leadPath)) {
+        try {
+          leadData = JSON.parse(fs.readFileSync(leadPath, 'utf8'));
+        } catch (err) {
+          console.error(`Erro ao carregar lead order_${orderId}.json:`, err);
+        }
+      }
+    }
 
     const finalAmount = amount || 1290;
     const stripeKey = process.env.STRIPE_SECRET_KEY;
@@ -688,11 +1193,35 @@ app.post('/api/payment/stripe/create-intent', async (req, res) => {
       console.warn("Stripe secret key is missing or placeholder. Using simulated clientSecret.");
       
       const mockId = 'mock_stripe_' + Date.now();
-      const ordersDir = getOrdersDir();
+      const updatedOrder = {
+        ...leadData,
+        orderId: orderId || leadData.orderId || '',
+        paymentId: mockId,
+        name: name || leadData.name || '',
+        email: email || leadData.email || '',
+        phone: phone || leadData.phone || '',
+        selectedBumps: selectedBumps || leadData.selectedBumps || [false, false, false, false, false],
+        generatedImage: leadData.generatedImage || generatedImage || '',
+        amount: finalAmount,
+        isMock: true,
+        emailSent: false,
+        paymentMethod: 'card',
+        status: 'pending',
+        createdAt: leadData.createdAt || new Date().toISOString(),
+        paymentCreatedAt: new Date().toISOString()
+      };
+
       fs.writeFileSync(
         path.join(ordersDir, `${mockId}.json`),
-        JSON.stringify({ name, email, phone, selectedBumps, generatedImage, amount: finalAmount, isMock: true, emailSent: false }, null, 2)
+        JSON.stringify(updatedOrder, null, 2)
       );
+
+      if (orderId) {
+        fs.writeFileSync(
+          path.join(ordersDir, `order_${orderId}.json`),
+          JSON.stringify({ ...updatedOrder, status: 'pending' }, null, 2)
+        );
+      }
 
       return res.json({
         success: true,
@@ -717,11 +1246,35 @@ app.post('/api/payment/stripe/create-intent', async (req, res) => {
 
     // Save order details to local orders directory
     const paymentIntentId = paymentIntent.id;
-    const ordersDir = getOrdersDir();
+    const updatedOrder = {
+      ...leadData,
+      orderId: orderId || leadData.orderId || '',
+      paymentId: paymentIntentId,
+      name: name || leadData.name || '',
+      email: email || leadData.email || '',
+      phone: phone || leadData.phone || '',
+      selectedBumps: selectedBumps || leadData.selectedBumps || [false, false, false, false, false],
+      generatedImage: leadData.generatedImage || generatedImage || '',
+      amount: finalAmount,
+      isMock: false,
+      emailSent: false,
+      paymentMethod: 'card',
+      status: 'pending',
+      createdAt: leadData.createdAt || new Date().toISOString(),
+      paymentCreatedAt: new Date().toISOString()
+    };
+
     fs.writeFileSync(
       path.join(ordersDir, `${paymentIntentId}.json`),
-      JSON.stringify({ name, email, phone, selectedBumps, generatedImage, amount: finalAmount, isMock: false, emailSent: false }, null, 2)
+      JSON.stringify(updatedOrder, null, 2)
     );
+
+    if (orderId) {
+      fs.writeFileSync(
+        path.join(ordersDir, `order_${orderId}.json`),
+        JSON.stringify({ ...updatedOrder, status: 'pending' }, null, 2)
+      );
+    }
 
     return res.json({
       success: true,
@@ -867,7 +1420,79 @@ app.post('/api/payment/pix/webhook', async (req, res) => {
   }
 });
 
+// ========================================================
+// ADMIN ENDPOINTS
+// ========================================================
+app.get('/api/admin/orders', async (req, res) => {
+  try {
+    const authHeader = req.headers['authorization'];
+    if (!authHeader || authHeader !== 'Bearer 240374') {
+      return res.status(401).json({ error: 'Acesso não autorizado.' });
+    }
+
+    const ordersDir = getOrdersDir();
+    const files = fs.readdirSync(ordersDir);
+    const orders = [];
+
+    const leadFiles = files.filter(f => f.startsWith('order_') && f.endsWith('.json'));
+    const otherFiles = files.filter(f => !f.startsWith('order_') && f.endsWith('.json'));
+
+    const processedOrderIds = new Set();
+
+    for (const file of leadFiles) {
+      try {
+        const filePath = path.join(ordersDir, file);
+        const data = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+        orders.push(data);
+        if (data.orderId) {
+          processedOrderIds.add(data.orderId);
+        }
+      } catch (err) {
+        console.error(`Erro ao ler arquivo ${file}:`, err);
+      }
+    }
+
+    for (const file of otherFiles) {
+      try {
+        const filePath = path.join(ordersDir, file);
+        const data = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+        
+        if (!data.orderId || !processedOrderIds.has(data.orderId)) {
+          orders.push({
+            orderId: data.orderId || file.replace('.json', ''),
+            name: data.name || 'Cliente antigo',
+            email: data.email || '',
+            cpf: data.cpf || '',
+            phone: data.phone || '',
+            generatedImage: data.generatedImage || '',
+            selectedBumps: data.selectedBumps || [false, false, false, false, false],
+            amount: data.amount || 0,
+            status: data.emailSent ? 'paid' : (data.isMock ? 'pending' : 'paid'),
+            paymentMethod: data.paymentMethod || (data.cpf ? 'pix' : 'card'),
+            createdAt: data.createdAt || data.emailSentAt || new Date(fs.statSync(filePath).mtime).toISOString(),
+            isMock: data.isMock || false
+          });
+        }
+      } catch (err) {
+        console.error(`Erro ao ler arquivo legacy ${file}:`, err);
+      }
+    }
+
+    orders.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+
+    res.json({ success: true, orders });
+  } catch (error) {
+    console.error("Erro na listagem do admin:", error);
+    res.status(500).json({ error: 'Erro ao listar pedidos.' });
+  }
+});
+
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`Server rodando na porta ${PORT}`);
+  try {
+    await loadModel();
+  } catch (err) {
+    console.error("Falha ao inicializar FaceAPI no startup:", err);
+  }
 });
